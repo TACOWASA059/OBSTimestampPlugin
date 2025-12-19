@@ -16,14 +16,14 @@ local chrome_path   = [[C:\Program Files\Google\Chrome\Application\chrome.exe]]
 local user_data_dir = [[C:\temp\chrome_dev]]
 local cdp_port      = 9222
 local target_url    = "https://gigafile.nu/"
-local mediaplayer_url    = "https://tacowasa059.github.io/mediaplayer.github.io/"
+local mediaplayer_url    = "https://tacowasa059.github.io/mediaplayer_v2.github.io/"
 
-local auto_on_stop  = false -- 録画停止時に自動アップロード
 local open_player_on_stop= true -- 録画停止時にメディアプレイヤーを自動起動
 
 local recent_video_path = ""
 local recent_txt_path   = ""
 local g_settings = nil
+local enable_experimental_features = false
 
 
 -- ===== ログ/ユーティリティ =====
@@ -238,102 +238,20 @@ end
 local function start_chrome_if_needed()
     local v=http_get("127.0.0.1",cdp_port,"/json/version")
     if v and #v>0 then return true end
-    local cmd=string.format('cmd /c start "" "%s" --remote-debugging-port=%d --user-data-dir="%s" --remote-debugging-address=127.0.0.1', chrome_path, cdp_port, user_data_dir)
+    local exp_flag = enable_experimental_features
+        and " --enable-experimental-web-platform-features"
+        or ""
+
+    local cmd = string.format(
+      'cmd /c start "" "%s" --remote-debugging-port=%d --no-first-run --no-default-browser-check --user-data-dir="%s"%s --remote-debugging-address=127.0.0.1',
+      chrome_path, cdp_port, user_data_dir, exp_flag
+    )
+
     os.execute(cmd)
     for i=1,15 do sleep(1) v=http_get("127.0.0.1",cdp_port,"/json/version"); if v and #v>0 then return true end end
     return false
 end
 
--- ===== 単一ファイルをアップする =====
-local function upload_one(path)
-    if not path or path=="" then warn("アップロード対象のパスが空です"); return end
-    if not start_chrome_if_needed() then err("ChromeのCDPポートに接続できません"); return end
-
-    -- 新規タブ作成（PUT）。両方の書式で試す
-    local enc = urlencode(target_url)
-    local new_json = http_req("PUT","127.0.0.1",cdp_port,"/json/new?"..enc,nil,nil)
-    if not new_json or new_json=="" then
-      new_json = http_req("PUT","127.0.0.1",cdp_port,"/json/new?url="..enc,nil,nil)
-    end
-
-    -- page の WS を優先して拾う
-    local ws_url = new_json and pick_page_ws(new_json)
-    if not ws_url then
-          warn("newでWS取れず。/jsonから既存タブを検索")
-          local list_json = http_req("GET","127.0.0.1",cdp_port,"/json",nil,nil)
-          if not list_json or list_json=="" then
-            err("new/json 取得失敗。Chromeの --remote-debugging-port="..cdp_port.." を確認してね。")
-            return
-          end
-          ws_url = pick_page_ws(list_json)
-          if not ws_url then
-            err("page ターゲットが見つかりません。/json 応答の一部: "..string.sub(list_json,1,200))
-            return
-          end
-    end
-
-    local path_ws = ws_url:match("ws://127%.0%.0%.1:"..cdp_port.."(.*)") or ws_url:match("ws://localhost:"..cdp_port.."(.*)")
-    if not path_ws then err("WSパス抽出失敗: "..tostring(ws_url)); return end
-
-    local ws, ee = ws_connect("127.0.0.1",cdp_port,path_ws); if not ws then err("WS接続失敗: "..(ee or "?")); return end
-
-    if not (cdp_send(ws,"Page.enable")
-          and cdp_send(ws,"Network.enable")
-          and cdp_send(ws,"DOM.enable")
-          and cdp_send(ws,"Runtime.enable")) then
-      err("CDP enable失敗"); ws_close(ws); return
-    end
-
-    -- 既存タブ接続でも目的URLへ遷移（newでも無害）＋ちょい待ち
-    cdp_send(ws, "Page.navigate", string.format('{"url":"%s"}', target_url))
-    -- readyState待ち（既に入れてるならスキップ）
-    local ok=false
-    for i=1,100 do
-    local r = cdp_send(ws,"Runtime.evaluate",'{"expression":"document.readyState","returnByValue":true}')
-    local st = r and r:match([["value"%s*:%s*"([^"]+)"]])
-    if st=="complete" or st=="interactive" then ok=true; break end
-    sleep(0.1)
-    end
-
-    -- 要素が見つかった後に、クリック処理を実行
-    local js = "(function(){const el = document.querySelector('li[data-lifetime-val=\"100\"]');if(!el) return \"notfound_again\";el.click();})();"
-    local r = cdp_send(ws,"Runtime.evaluate",
-    string.format('{"expression":%q,"returnByValue":true,"awaitPromise":true,"userGesture":true}', js))
-
-
-    -- input[type=file] にファイル設定
-    local doc = cdp_send(ws, "DOM.getDocument", '{"depth":-1,"pierce":true}')
-    local rootId = doc and doc:match([["root"%s*:%s*{.-"nodeId"%s*:%s*(%d+)]])
-    if not rootId then
-      err("root nodeId取得失敗。 " .. tostring(doc and doc:sub(1,180) or "nil"))
-      ws_close(ws); return
-    end
-
-    local q = cdp_send(ws, "DOM.querySelector",
-    string.format('{"nodeId":%s,"selector":"input[type=file]"}', rootId))
-    local fileNode = q and q:match([["nodeId"%s*:%s*(%d+)]])
-    if not fileNode then
-      err("file input見つからず（セレクタ要調整）"); ws_close(ws); return
-    end
-
-    -- 拡張子が.mp4でない場合、同名の.mp4があればそちらを使う
-    local send_path = path
-    if not path:lower():match("%.mp4$") then
-      local mp4_path = path:gsub("%.[^\\/.]+$", ".mp4")
-      if file_exists_utf8(mp4_path) then
-          send_path = mp4_path
-      end
-    end
-
-    -- セット
-    local ok = cdp_send(ws, "DOM.setFileInputFiles",
-    string.format('{"nodeId":%s,"files":["%s"]}', fileNode, json_escape(send_path)))
-    if not ok then
-        err("DOM.setFileInputFiles失敗"); ws_close(ws); return
-    end
-
-    ws_close(ws)
-end
 -- ====== 時間記録用 ======= --
 
 -- キーの押下状態を確認
@@ -445,12 +363,22 @@ local function open_mediaplayer_with_recent()
   end
   local videoNode = qsel("#video-file")
   local annoNode  = qsel("#annotation-file")
+  local videoNode2 = qsel("#videoFile")
 
   if video and videoNode then
     cdp_send(ws, "DOM.setFileInputFiles", string.format('{"nodeId":%s,"files":["%s"]}', videoNode, json_escape(video)))
   end
   if txt and annoNode then
     cdp_send(ws, "DOM.setFileInputFiles", string.format('{"nodeId":%s,"files":["%s"]}', annoNode, json_escape(txt)))
+  end
+
+  if videoNode2 then
+    if video then
+      cdp_send(ws, "DOM.setFileInputFiles", string.format('{"nodeId":%s,"files":["%s"]}', videoNode2, json_escape(video)))
+    end
+    if txt then
+      cdp_send(ws, "DOM.setFileInputFiles", string.format('{"nodeId":%s,"files":["%s"]}', videoNode2, json_escape(txt)))
+    end
   end
 
   ws_close(ws)
@@ -496,7 +424,6 @@ local function remux_poll()
     end
     remux_watch = nil
 
-    if auto_on_stop then upload_one(target) end
     if open_player_on_stop then open_mediaplayer_with_recent() end
   end
 end
@@ -540,7 +467,6 @@ local function on_frontend_event(event)
             log("録画終了: %s", last)
             
             if last:lower():match("%.mp4$") then
-              if auto_on_stop then upload_one(last) end
               if open_player_on_stop then open_mediaplayer_with_recent() end
 
             else
@@ -665,17 +591,27 @@ function script_properties()
 
     obs.obs_properties_add_text(props, "label_info1", "\n\n\n以下の実行にはChrome必須\n", obs.OBS_TEXT_INFO)
     obs.obs_properties_add_path(props,"chrome_path","Chrome 実行ファイル",obs.OBS_PATH_FILE,"chrome.exe;*.exe",chrome_path)
+
+    obs.obs_properties_add_text(
+        props,
+        "mediaplayer_url",
+        "メディアプレーヤーURL",
+        obs.OBS_TEXT_DEFAULT
+    )
+
+    obs.obs_properties_add_bool(
+        props,
+        "enable_experimental_features",
+        "Chromeの実験的機能(音声トラック選択用)を有効化"
+    )
+
+
+
     obs.obs_properties_add_bool(props,"open_player_on_stop","録画停止時にメディアプレーヤー起動(動画ファイルとTXTファイル)")
     obs.obs_properties_add_button(props,"btn_open_player","最近使用した動画ファイルとTXTでメディアプレーヤーを起動",function()
       open_mediaplayer_with_recent(); return true
     end)
 
-    obs.obs_properties_add_bool(props,"auto_on_stop","録画停止時にアップロード")
-    obs.obs_properties_add_button(props,"manual_btn","最近使用した動画ファイルをアップロード",function()
-      local target = (recent_video_path ~= "" and recent_video_path) or (obs.obs_frontend_get_last_recording and obs.obs_frontend_get_last_recording())
-      if target and target ~= "" then upload_one(target) else warn("最近使用した録画が見つかりません") end
-      return true
-    end)
     
     obs.obs_properties_add_path(props,"user_data_dir","ユーザーデータディレクトリ",obs.OBS_PATH_DIRECTORY,"",user_data_dir)
     obs.obs_properties_add_int(props,"cdp_port","CDPポート",1024,65535,1)
@@ -684,11 +620,39 @@ function script_properties()
 end
 
 function script_defaults(s)
-    obs.obs_data_set_default_string(s, "chrome_path",   [[C:\Program Files\Google\Chrome\Application\chrome.exe]])
-    obs.obs_data_set_default_string(s, "user_data_dir", [[C:\temp\chrome_dev]])
-    obs.obs_data_set_default_int(s,    "cdp_port",      9222)
-    obs.obs_data_set_default_bool(s,   "auto_on_stop",  false)
-    obs.obs_data_set_default_bool(s, "open_player_on_stop",false)
+    obs.obs_data_set_default_string(
+      s, 
+      "chrome_path",
+      [[C:\Program Files\Google\Chrome\Application\chrome.exe]]
+    )
+    obs.obs_data_set_default_string(
+      s, 
+      "user_data_dir", 
+      [[C:\temp\chrome_dev]]
+    )
+    obs.obs_data_set_default_int(
+      s,
+      "cdp_port",
+      9222
+    )
+    obs.obs_data_set_default_bool(
+      s, 
+      "open_player_on_stop",
+      false
+    )
+
+    obs.obs_data_set_default_string(
+      s,
+      "mediaplayer_url",
+      "https://tacowasa059.github.io/mediaplayer_v2.github.io/"
+    )
+
+    obs.obs_data_set_default_bool(
+      s,
+      "enable_experimental_features",
+      false
+    )
+
 end
 
 function script_update(s)
@@ -696,11 +660,16 @@ function script_update(s)
     chrome_path   = obs.obs_data_get_string(s,"chrome_path")
     user_data_dir = obs.obs_data_get_string(s,"user_data_dir")
     cdp_port      = obs.obs_data_get_int(s,"cdp_port")
-    auto_on_stop  = obs.obs_data_get_bool(s,"auto_on_stop")
+
     open_player_on_stop = obs.obs_data_get_bool(s,"open_player_on_stop")
 
     folder_path = obs.obs_data_get_string(s, "folder_path")
     trigger_key = obs.obs_data_get_string(s, "trigger_key")
+
+    mediaplayer_url = obs.obs_data_get_string(s, "mediaplayer_url")
+
+    enable_experimental_features = obs.obs_data_get_bool(s, "enable_experimental_features")
+
 
     -- 選択されたキーに基づいて仮想キーコードを設定
     -- キーマッピング
