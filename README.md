@@ -1,4 +1,25 @@
 ## OBS Lua Script
-![image](https://github.com/user-attachments/assets/5af00705-b920-4d16-ae5f-7f3c7f35b920)
+OBS録画中にタイムスタンプを記録するためのプラグインです。
+
+`トリガーキー`を押した際に、出力フォルダ内にタイムスタンプ`hh:mm:ss`形式のタイムスタンプを記録した`.txt`ファイルを生成します。
+
+
+### その他の機能
+- 録画終了時に自動でChromeのメディアプレイヤーに自動でアクセスする機能
+
+※初回実行時は時間がかかります。
+
+<img width="684" height="542" alt="image" src="https://github.com/user-attachments/assets/70fa5ac5-aead-4bb2-a079-c57feea6a019" />
+
+- `Chromeの実験的機能を有効化`にチェックを押すことで、メディアプレイヤーにてオーディオトラックを選択できるようになります。
+- 独立のユーザープロファイルを使用することで、普段使いのChromeに影響しない設計としています。
+
+<img width="674" height="323" alt="image" src="https://github.com/user-attachments/assets/fa5f79fc-6855-4d2b-a2b5-d7c979e87195" />
+
+### 注意点
+- メディアプレイヤーの自動アクセスには正しいChrome実行ファイルを参照する必要があります。
+- ユーザーデータディレクトリは、普段とは異なるパスを指定することをお勧めします。
+- CDPポートは割り当てられていないポート番号であれば何でも良いです。
+
 
 
