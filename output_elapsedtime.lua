@@ -592,12 +592,18 @@ function script_properties()
     obs.obs_properties_add_text(props, "label_info1", "\n\n\n以下の実行にはChrome必須\n", obs.OBS_TEXT_INFO)
     obs.obs_properties_add_path(props,"chrome_path","Chrome 実行ファイル",obs.OBS_PATH_FILE,"chrome.exe;*.exe",chrome_path)
 
-    obs.obs_properties_add_text(
+    -- 編集可能なドロップダウンリスト
+    local url_combo = obs.obs_properties_add_list(
         props,
         "mediaplayer_url",
         "メディアプレーヤーURL",
-        obs.OBS_TEXT_DEFAULT
+        obs.OBS_COMBO_TYPE_EDITABLE,
+        obs.OBS_COMBO_FORMAT_STRING
     )
+    -- プリセットURLを追加
+    obs.obs_property_list_add_string(url_combo, "https://tacowasa059.github.io/mediaplayer_v2.github.io/", "https://tacowasa059.github.io/mediaplayer_v2.github.io/")
+    obs.obs_property_list_add_string(url_combo, "https://tacowasa059.github.io/mediaplayer.github.io/", "https://tacowasa059.github.io/mediaplayer.github.io/")
+    obs.obs_property_list_add_string(url_combo, "https://herusuka.github.io/memo_tool/", "https://herusuka.github.io/memo_tool/")
 
     obs.obs_properties_add_bool(
         props,
