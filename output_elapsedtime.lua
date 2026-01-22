@@ -7,7 +7,7 @@ local start_time = nil -- 録画開始時間
 local folder_path = "" -- 出力フォルダを保存する変数
 local file_name = "" -- 出力ファイル名
 local trigger_key = "" -- トリガーキーを保存する変数
-local VK_F5 = 0x74 -- デフォルトの仮想キーコード
+local VK_F5 = 0x01 -- デフォルトの仮想キーコード
 local last_trigger_time = 0 -- 最後にキーが押された時間
 local cool_down = 2 -- クールタイム（秒）
 
@@ -15,7 +15,6 @@ local cool_down = 2 -- クールタイム（秒）
 local chrome_path   = [[C:\Program Files\Google\Chrome\Application\chrome.exe]]
 local user_data_dir = [[C:\temp\chrome_dev]]
 local cdp_port      = 9222
-local target_url    = "https://gigafile.nu/"
 local mediaplayer_url    = "https://tacowasa059.github.io/mediaplayer_v2.github.io/"
 
 local open_player_on_stop= true -- 録画停止時にメディアプレイヤーを自動起動
@@ -24,7 +23,7 @@ local recent_video_path = ""
 local recent_txt_path   = ""
 local g_settings = nil
 local enable_experimental_features = false
-
+local ignore_first_click = false
 
 -- ===== ログ/ユーティリティ =====
 local function log(fmt, ...)  obs.script_log(obs.LOG_INFO,  string.format(fmt, ...)) end
@@ -260,12 +259,58 @@ function is_key_pressed(virtual_key_code)
     return state ~= 0
 end
 
+-- Windows APIを使用してキー名を取得
+function get_key_name_text(vk_code)
+    local mouse_names = {
+        [0x01] = "Mouse Left",
+        [0x02] = "Mouse Right",
+        [0x04] = "Mouse Middle",
+        [0x05] = "Mouse X1",
+        [0x06] = "Mouse X2",
+    }
+    if mouse_names[vk_code] then
+        return mouse_names[vk_code]
+    end
+
+    local scan_code = ffi.C.MapVirtualKeyW(vk_code, 0)
+    local lParam = bit.lshift(scan_code, 16)
+    
+    if vk_code >= 0x21 and vk_code <= 0x2E then
+        lParam = bit.bor(lParam, bit.lshift(1, 24))
+    end
+    
+    local buf_len = 256
+    local buf = ffi.new("unsigned short[?]", buf_len)
+    local ret = ffi.C.GetKeyNameTextW(lParam, buf, buf_len)
+    
+    if ret > 0 then
+        local CP_UTF8 = 65001
+        local needed = ffi.C.WideCharToMultiByte(CP_UTF8, 0, buf, -1, nil, 0, nil, nil)
+        if needed > 0 then
+            local utf8_buf = ffi.new("char[?]", needed)
+            ffi.C.WideCharToMultiByte(CP_UTF8, 0, buf, -1, utf8_buf, needed, nil, nil)
+            return ffi.string(utf8_buf)
+        end
+    end
+    return string.format("VK_0x%02X", vk_code)
+end
+
+-- キー検出関数
+function detect_pressed_key()
+    for vk = 0x01, 0xFF do
+        if is_key_pressed(vk) then
+             return get_key_name_text(vk), vk
+        end
+    end
+    return nil, nil
+end
+
 -- 秒をhh:mm:ss形式に変換する
 function seconds_to_hms(seconds)
     local hours = math.floor(seconds / 3600)
     local minutes = math.floor((seconds % 3600) / 60)
     local seconds = seconds % 60
-    return string.format("%02d:%02d:%02d ", hours, minutes, seconds)
+    return string.format("[%02d:%02d:%02d] ", hours, minutes, seconds)
 end
 
 -- エクスプローラーで指定フォルダを開く関数
@@ -278,6 +323,34 @@ function open_folder_in_explorer(folder)
     if tonumber(ret) <= 32 then
         warn("ShellExecuteW 失敗: " .. tostring(ret))
     end
+end
+
+-- OBSの録画設定パスを取得する関数
+function get_obs_recording_path()
+    local path = nil
+    local profile = obs.obs_frontend_get_profile_config()
+    if not profile then return nil end
+
+    -- モード確認 (Simple vs Advanced)
+    local output_mode = obs.config_get_string(profile, "Output", "Mode")
+    
+    if output_mode == "Advanced" then
+        path = obs.config_get_string(profile, "AdvOut", "RecFilePath")
+        -- RecFilePathが空ならRecDirを見るケースもあるが、基本はRecFilePathかRecDir
+        if not path or path == "" then
+             path = obs.config_get_string(profile, "AdvOut", "RecDir")
+        end
+    else
+        -- Simple Mode
+        path = obs.config_get_string(profile, "SimpleOutput", "FilePath")
+    end
+
+    if path and path ~= "" then
+        -- パス区切りの正規化
+        path = path:gsub("\\", "/")
+    end
+    
+    return path
 end
 
 -- 日付をYYYY-MM-DD_hh-mm-ss形式に変換してファイル名として使用
@@ -439,18 +512,66 @@ local function wait_mp4_async(original_path)
     obs.timer_add(remux_poll, 500)  -- 500msごとにチェック
 end
 
+local function is_remux_enabled()
+    local profile = obs.obs_frontend_get_profile_config()
+    if not profile then return false end
+    return obs.config_get_bool(profile, "Video", "AutoRemux")
+end
+
 -- ===== 録画停止トリガ =====
 local function on_frontend_event(event)
     if event == obs.OBS_FRONTEND_EVENT_RECORDING_STARTED then
         start_time = os.time() -- 録画開始時刻を取得
-        file_name = folder_path .. "/" .. recording_start_time_as_filename() -- 録画開始時間をファイル名として使用
 
-        log("ファイルへの書き込みを開始: " .. file_name)
+        -- folder_path は script_update で解決済み。もし空なら警告して終了
+        if not folder_path or folder_path == "" then
+             warn("出力フォルダが設定されていません。")
+             file_name = ""
+             return
+        end
 
-        local line = "start\n"
-        local ok, werr = write_utf8_append(file_name, line)
-        if not ok then
-            warn("FFI append failed: " .. tostring(werr) .. " : " .. tostring(file_name)  .. " 出力フォルダが設定されていない可能性があります")
+        local out_dir = folder_path
+        -- 末尾スラッシュ補正
+        if out_dir:sub(-1) ~= "/" and out_dir:sub(-1) ~= "\\" then
+            out_dir = out_dir .. "/"
+        end
+
+        -- 現在の録画出力からファイル名取得を試みる
+        local rec_filename_base = nil
+        local output = obs.obs_frontend_get_recording_output()
+        if output then
+            local settings = obs.obs_output_get_settings(output)
+            local path = obs.obs_data_get_string(settings, "path")
+            obs.obs_data_release(settings)
+            obs.obs_output_release(output)
+            
+            if path and path ~= "" then
+                -- フルパスからファイル名(拡張子あり)を取り出す
+                local name = path:match(".*[/\\](.-)$") or path
+                -- 拡張子を除く
+                rec_filename_base = name:match("^(.*)%.[^.]+$") or name
+            end
+        end
+
+        if rec_filename_base then
+             log("録画ファイル名に合わせて設定: " .. rec_filename_base .. ".txt")
+             file_name = out_dir .. rec_filename_base .. ".txt"
+        else
+            -- 取得できなかった場合はタイムスタンプ
+            file_name = out_dir .. recording_start_time_as_filename()
+        end
+
+        if file_name ~= "" then
+            log("ファイルへの書き込みを開始: " .. file_name)
+
+            local line = "start\n"
+            if rec_filename_base then
+                line = rec_filename_base .. "\n"
+            end
+            local ok, werr = write_utf8_append(file_name, line)
+            if not ok then
+                warn("FFI append failed: " .. tostring(werr) .. " : " .. tostring(file_name))
+            end
         end
     end
 
@@ -466,12 +587,10 @@ local function on_frontend_event(event)
             recent_video_path = last
             log("録画終了: %s", last)
             
-            if last:lower():match("%.mp4$") then
-              if open_player_on_stop then open_mediaplayer_with_recent() end
-
+            if is_remux_enabled() then
+                wait_mp4_async(last)
             else
-              wait_mp4_async(last)
-
+                if open_player_on_stop then open_mediaplayer_with_recent() end
             end
             if g_settings then
                 script_save(g_settings)
@@ -493,6 +612,7 @@ function script_save(settings)
   obs.obs_data_set_string(settings, "recent_txt_path",   recent_txt_path   or "")
 end
 
+
 function script_properties()
     local props=obs.obs_properties_create()
     -- 出力フォルダを指定するためのテキスト入力フィールドを追加
@@ -503,74 +623,41 @@ function script_properties()
         open_folder_in_explorer(folder_path)
     end)
 
-    -- トリガーキーを選択するためのドロップダウンリストを追加
-    local p = obs.obs_properties_add_list(props, "trigger_key", "トリガーキー", obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
-    -- ファンクションキー
-    for i = 1, 12 do
-        obs.obs_property_list_add_string(p, "F" .. tostring(i), "F" .. tostring(i))
-    end
+    -- トリガーキー設定セクション
+    obs.obs_properties_add_text(props, "label_key_detect", "\n=== トリガーキー設定 ===", obs.OBS_TEXT_INFO)
     
-    -- アルファベットキー
-    for i = string.byte("A"), string.byte("Z") do
-        local key = string.char(i)
-        obs.obs_property_list_add_string(p, key, key)
-    end
-
-    -- 数字キー
-    for i = 0, 9 do
-        obs.obs_property_list_add_string(p, tostring(i), tostring(i))
-    end
-
-    -- マウスボタン
-    obs.obs_property_list_add_string(p, "Left Mouse Button", "LButton")
-    obs.obs_property_list_add_string(p, "Right Mouse Button", "RButton")
-    obs.obs_property_list_add_string(p, "Middle Mouse Button", "MButton")
-    obs.obs_property_list_add_string(p, "Mouse Side Button 1", "XButton1")
-    obs.obs_property_list_add_string(p, "Mouse Side Button 2", "XButton2")
-
-    -- 矢印キー
-    obs.obs_property_list_add_string(p, "Up", "Up")
-    obs.obs_property_list_add_string(p, "Down", "Down")
-    obs.obs_property_list_add_string(p, "Left", "Left")
-    obs.obs_property_list_add_string(p, "Right", "Right")
-
-    -- 修飾キー
-    obs.obs_property_list_add_string(p, "Space", "Space")
-    obs.obs_property_list_add_string(p, "Enter", "Enter")
-    obs.obs_property_list_add_string(p, "Escape", "Escape")
-    obs.obs_property_list_add_string(p, "Tab", "Tab")
-    obs.obs_property_list_add_string(p, "Shift", "Shift")
-    obs.obs_property_list_add_string(p, "Ctrl", "Ctrl")
-    obs.obs_property_list_add_string(p, "Alt", "Alt")
-    obs.obs_property_list_add_string(p, "CapsLock", "CapsLock")
-    obs.obs_property_list_add_string(p, "Backspace", "Backspace")
-
-    -- テンキー
-    for i = 0, 9 do
-        obs.obs_property_list_add_string(p, "Numpad" .. tostring(i), "Numpad" .. tostring(i))
-    end
-    obs.obs_property_list_add_string(p, "NumpadPlus", "NumpadPlus")
-    obs.obs_property_list_add_string(p, "NumpadMinus", "NumpadMinus")
-    obs.obs_property_list_add_string(p, "NumpadMultiply", "NumpadMultiply")
-    obs.obs_property_list_add_string(p, "NumpadDivide", "NumpadDivide")
-    obs.obs_property_list_add_string(p, "NumpadEnter", "NumpadEnter")
-    obs.obs_property_list_add_string(p, "NumpadDecimal", "NumpadDecimal")
-
-    -- その他のキー
-    obs.obs_property_list_add_string(p, "Insert", "Insert")
-    obs.obs_property_list_add_string(p, "Delete", "Delete")
-    obs.obs_property_list_add_string(p, "Home", "Home")
-    obs.obs_property_list_add_string(p, "End", "End")
-    obs.obs_property_list_add_string(p, "PageUp", "PageUp")
-    obs.obs_property_list_add_string(p, "PageDown", "PageDown")
-    obs.obs_property_list_add_string(p, "PrintScreen", "PrintScreen")
-    obs.obs_property_list_add_string(p, "ScrollLock", "ScrollLock")
-    obs.obs_property_list_add_string(p, "Pause", "Pause")
-    obs.obs_property_list_add_string(p, "NumLock", "NumLock")
-    obs.obs_property_list_add_string(p, "ContextMenu", "ContextMenu")
+    -- 現在のトリガーキーを表示
+    obs.obs_properties_add_text(props, "current_trigger_key", "現在のトリガーキー: 【" .. (trigger_key ~= "" and trigger_key or "未設定") .. "】", obs.OBS_TEXT_INFO)
+    
+    -- キー検出ボタン
+    obs.obs_properties_add_button(props, "detect_key_button", "キー検出開始", function(props, p)
+        key_detection_mode = true
+        detected_key_name = ""
+        ignore_first_click = true
+        log("キー検出モード開始: 任意のキーを押してください")
+        
+        -- 現在のトリガーキー表示を更新
+        local p_current = obs.obs_properties_get(props, "current_trigger_key")
+        obs.obs_property_set_description(p_current, "現在のトリガーキー: 検出中... (キーを押して[更新]を押してください)")
+        
+        return true
+    end)
+    
+    -- 手動更新ボタン
+    obs.obs_properties_add_button(props, "refresh_button", "更新", function(props, p)
+        -- 現在の検出キー名を再取得して表示更新
+        local p_current = obs.obs_properties_get(props, "current_trigger_key")
+        local text = "現在のトリガーキー: 【" .. (trigger_key ~= "" and trigger_key or "未設定") .. "】"
+        if key_detection_mode then
+             text = "現在のトリガーキー: 検出中... (キーを押して[更新]を押してください)"
+        end
+        obs.obs_property_set_description(p_current, text)
+        return true -- ここでtrueを返すことで画面リフレッシュ
+    end)
 
     -- 最近使用したファイル（ユーザーが手動で差し替えられるように Path 入力にする）
-    obs.obs_properties_add_text(props, "label_info0", "\n\n録画完了してから押すと更新されます", obs.OBS_TEXT_INFO)
+    obs.obs_properties_add_text(props, "label_recent", "\n\n=== 最近使用したファイル ===", obs.OBS_TEXT_INFO)
+    obs.obs_properties_add_text(props, "label_info0", "録画完了してから押すと更新されます", obs.OBS_TEXT_INFO)
     obs.obs_properties_add_button(props, "reload_button", "最近使用したファイル更新", function()
       return true
     end)
@@ -589,7 +676,8 @@ function script_properties()
         open_folder_in_explorer(recent_txt_path)
     end)
 
-    obs.obs_properties_add_text(props, "label_info1", "\n\n\n以下の実行にはChrome必須\n", obs.OBS_TEXT_INFO)
+    obs.obs_properties_add_text(props, "label_experiment", "\n\n=== 実験的機能 ===", obs.OBS_TEXT_INFO)
+    obs.obs_properties_add_text(props, "label_info1", "Chromeを用いてメモツールを開く\n以下の実行にはChrome必須", obs.OBS_TEXT_INFO)
     obs.obs_properties_add_path(props,"chrome_path","Chrome 実行ファイル",obs.OBS_PATH_FILE,"chrome.exe;*.exe",chrome_path)
 
     -- 編集可能なドロップダウンリスト
@@ -663,66 +751,43 @@ end
 
 function script_update(s)
     g_settings = s
-    chrome_path   = obs.obs_data_get_string(s,"chrome_path")
-    user_data_dir = obs.obs_data_get_string(s,"user_data_dir")
-    cdp_port      = obs.obs_data_get_int(s,"cdp_port")
+    folder_path = obs.obs_data_get_string(g_settings, "folder_path")
+    -- 空ならOBS設定から取得して内部変数にセットし、設定にも反映させる
+    if folder_path == "" then
+        local obs_rec_path = get_obs_recording_path()
+        if obs_rec_path and obs_rec_path ~= "" then
+            folder_path = obs_rec_path
+            -- UI側(プロパティ)にも値をセットして表示させる
+            obs.obs_data_set_string(g_settings, "folder_path", folder_path)
+            log("出力パス未設定のため、OBS録画パスをデフォルトとして使用(設定に反映): " .. folder_path)
+        end
+    end
+
+    chrome_path   = obs.obs_data_get_string(g_settings,"chrome_path")
+    user_data_dir = obs.obs_data_get_string(g_settings,"user_data_dir")
+    cdp_port      = obs.obs_data_get_int(g_settings,"cdp_port")
 
     open_player_on_stop = obs.obs_data_get_bool(s,"open_player_on_stop")
-
-    folder_path = obs.obs_data_get_string(s, "folder_path")
-    trigger_key = obs.obs_data_get_string(s, "trigger_key")
 
     mediaplayer_url = obs.obs_data_get_string(s, "mediaplayer_url")
 
     enable_experimental_features = obs.obs_data_get_bool(s, "enable_experimental_features")
 
-
-    -- 選択されたキーに基づいて仮想キーコードを設定
-    -- キーマッピング
-    local key_map = {
-        -- ファンクションキー
-        F1 = 0x70, F2 = 0x71, F3 = 0x72, F4 = 0x73, F5 = 0x74,
-        F6 = 0x75, F7 = 0x76, F8 = 0x77, F9 = 0x78, F10 = 0x79,
-        F11 = 0x7A, F12 = 0x7B,
-
-        -- 矢印キー
-        Up = 0x26, Down = 0x28, Left = 0x25, Right = 0x27,
-
-        -- 修飾キー
-        Space = 0x20, Enter = 0x0D, Escape = 0x1B, Tab = 0x09,
-        Shift = 0x10, Ctrl = 0x11, Alt = 0x12, CapsLock = 0x14,
-        Backspace = 0x08,
-
-        -- テンキー
-        Numpad0 = 0x60, Numpad1 = 0x61, Numpad2 = 0x62, Numpad3 = 0x63,
-        Numpad4 = 0x64, Numpad5 = 0x65, Numpad6 = 0x66, Numpad7 = 0x67,
-        Numpad8 = 0x68, Numpad9 = 0x69, NumpadPlus = 0x6B,
-        NumpadMinus = 0x6D, NumpadMultiply = 0x6A, NumpadDivide = 0x6F,
-        NumpadEnter = 0x0D, NumpadDecimal = 0x6E,
-
-        -- その他のキー
-        Insert = 0x2D, Delete = 0x2E, Home = 0x24, End = 0x23,
-        PageUp = 0x21, PageDown = 0x22, PrintScreen = 0x2C,
-        ScrollLock = 0x91, Pause = 0x13, NumLock = 0x90,
-        ContextMenu = 0x5D,
-
-        -- マウスボタン
-        LButton = 0x01, RButton = 0x02, MButton = 0x04,
-        XButton1 = 0x05, XButton2 = 0x06
-    }
-
-    -- アルファベットキー
-    for i = string.byte("A"), string.byte("Z") do
-        local key = string.char(i)
-        key_map[key] = i
+    -- トリガーキーの設定読み込み(数値コード優先)
+    local saved_code = obs.obs_data_get_int(s, "trigger_key_code")
+    trigger_key = obs.obs_data_get_string(s, "trigger_key")
+    
+    if saved_code and saved_code ~= 0 then
+        VK_F5 = saved_code
+        -- FFIが利用可能で、user32がロードされていれば名前を取得して表示を更新
+        if user32 then
+             local name = get_key_name_text(saved_code)
+             if name then
+                 trigger_key = name
+                 detected_key_name = name -- UI表示用にも反映
+             end
+        end
     end
-
-    -- 数字キー
-    for i = 0, 9 do
-        key_map[tostring(i)] = 0x30 + i
-    end
-
-    VK_F5 = key_map[trigger_key] or 0x74
 
     -- UI側から手動更新されたときに反映
     local rv = obs.obs_data_get_string(s, "recent_video_path")
@@ -785,22 +850,63 @@ function script_load(settings)
                     DWORD* lpNumberOfBytesWritten, LPVOID lpOverlapped);
 
         BOOL CloseHandle(HANDLE hObject);
+
+        // キー名取得用
+        unsigned int MapVirtualKeyW(unsigned int uCode, unsigned int uMapType);
+        int GetKeyNameTextW(long lParam, unsigned short* lpString, int cchSize);
+        
+        // UTF-16 -> UTF-8
+        int WideCharToMultiByte(unsigned int CodePage, unsigned long dwFlags,
+                                const unsigned short* lpWideCharStr, int cchWideChar,
+                                char* lpMultiByteStr, int cbMultiByte,
+                                const char* lpDefaultChar, int* lpUsedDefaultChar);
     ]]
     if not shell32 then shell32 = ffi.load("shell32") end
+    if not user32 then user32 = ffi.load("user32") end
 
 end
+
 
 -- 毎フレームごとに呼ばれる関数
 function script_tick(seconds)
     local current_time = os.time()
+    
+    -- キー検出モード中の処理
+    if key_detection_mode then
+        local key_name, vk_code = detect_pressed_key()
+        if key_name and vk_code then
+            if vk_code == 0x01 and ignore_first_click then
+                ignore_first_click = false
+                return
+            end
+            if vk_code == 0xF2 then
+                return
+            end
+            
+            detected_key_name = key_name
+            trigger_key = key_name
+            VK_F5 = vk_code
+            key_detection_mode = false
+            
+            log(string.format("検出: %s = 0x%02X (%d)", key_name, vk_code, vk_code))
+            
+            -- 設定を保存
+            if g_settings then
+                obs.obs_data_set_string(g_settings, "trigger_key", trigger_key)
+                obs.obs_data_set_string(g_settings, "detected_key_name", detected_key_name)
+                obs.obs_data_set_int(g_settings, "trigger_key_code", vk_code) -- キーコードを保存
+            end
+          
+        end
+        return
+    end
 
     -- クールタイムが経過しているか確認
     if current_time - last_trigger_time >= cool_down then
-        -- 選択されたキーが押されたときに録画経過時間をファイルに書き込む
         if is_key_pressed(VK_F5) then
             if obs.obs_frontend_recording_active() then
                 write_elapsed_time_to_file()
-                last_trigger_time = current_time -- 最後にキーが押された時間を更新
+                last_trigger_time = current_time
             end
         end
     end
