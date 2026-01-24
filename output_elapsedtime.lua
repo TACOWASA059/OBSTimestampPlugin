@@ -34,6 +34,17 @@ local function json_escape(s) return (s:gsub('[\\"]',{['\\']='\\\\',['"']='\\"'}
 local function urlencode(s) return (s:gsub("([^%w%-%_%.%~])", function(c) return string.format("%%%02X", string.byte(c)) end)) end
 
 -- ===== UTF-16=======--
+
+-- UTF-8文字列をWindows API用のUTF-16配列に変換する関数
+local function W(s)
+    local CP_UTF8 = 65001
+    local n = ffi.C.MultiByteToWideChar(CP_UTF8, 0, s, #s, nil, 0)
+    local buf = ffi.new("unsigned short[?]", n + 1)
+    ffi.C.MultiByteToWideChar(CP_UTF8, 0, s, #s, buf, n)
+    buf[n] = 0
+    return buf
+end
+
 -- UTF-8パス対応でテキストをファイル末尾に追記する（WinAPI CreateFileW+WriteFile使用）
 local function write_utf8_append(path_utf8, text_utf8)
   local C = ffi.C
@@ -45,16 +56,7 @@ local function write_utf8_append(path_utf8, text_utf8)
   local FILE_ATTRIBUTE_NORMAL = 0x00000080
   local INVALID_HANDLE_VALUE = ffi.cast("HANDLE", -1)
 
-  local function utf8_to_wide(s)
-    local n = C.MultiByteToWideChar(CP_UTF8, 0, s, #s, nil, 0)
-    if n == 0 then return nil end
-    local buf = ffi.new("WCHAR[?]", n + 1)
-    C.MultiByteToWideChar(CP_UTF8, 0, s, #s, buf, n)
-    buf[n] = 0
-    return buf
-  end
-
-  local wpath = utf8_to_wide(path_utf8)
+  local wpath = W(path_utf8)
   if not wpath then return false, "MultiByteToWideChar(path) failed" end
 
   local h = C.CreateFileW(
@@ -79,14 +81,16 @@ local function write_utf8_append(path_utf8, text_utf8)
   return true
 end
 
--- UTF-8文字列をWindows API用のUTF-16配列に変換する関数
-local function W(s)
+-- UTF-16配列をUTF-8文字列に変換
+local function U16to8(buf)
     local CP_UTF8 = 65001
-    local n = ffi.C.MultiByteToWideChar(CP_UTF8, 0, s, #s, nil, 0)
-    local buf = ffi.new("unsigned short[?]", n + 1)
-    ffi.C.MultiByteToWideChar(CP_UTF8, 0, s, #s, buf, n)
-    buf[n] = 0
-    return buf
+    local needed = ffi.C.WideCharToMultiByte(CP_UTF8, 0, buf, -1, nil, 0, nil, nil)
+    if needed > 0 then
+        local utf8_buf = ffi.new("char[?]", needed)
+        ffi.C.WideCharToMultiByte(CP_UTF8, 0, buf, -1, utf8_buf, needed, nil, nil)
+        return ffi.string(utf8_buf)
+    end
+    return ""
 end
 
 local function file_exists_utf8(path_utf8)
@@ -105,6 +109,11 @@ local function get_file_size(path_utf8)
     local lo = tonumber(data[0].nFileSizeLow)
     return hi * 4294967296 + lo
 end
+
+local function filetime_to_int64(ft)
+    return tonumber(ft.dwHighDateTime) * 4294967296 + tonumber(ft.dwLowDateTime)
+end
+
 
 -- ===== WinHTTP / WebSocket（ffi） =====
 ffi.cdef[[
@@ -380,13 +389,56 @@ local function get_recent_video_and_saved_txt()
 end
 
 
-local function open_mediaplayer_with_recent()
-  local video, txt = get_recent_video_and_saved_txt()
+local function touch_access(path, mode)
+    if mode == "open" then
+        local h = ffi.C.CreateFileW(
+            W(path),
+            0x80000000,
+            1, 
+            nil,
+            3,
+            0,
+            nil
+        )
+
+        if h ~= ffi.cast("HANDLE", -1) then
+            local buf = ffi.new("char[1]")
+            local read = ffi.new("DWORD[1]")
+            ffi.C.ReadFile(h, buf, 1, read, nil)
+            ffi.C.CloseHandle(h)
+        end
+
+    elseif mode == "force" then
+        local h = ffi.C.CreateFileW(
+            W(path),
+            0x100,
+            0,
+            nil,
+            3,
+            0,
+            nil
+        )
+
+        if h ~= ffi.cast("HANDLE", -1) then
+            local now = os.time() * 10000000 + 116444736000000000
+            local ft = ffi.new("FILETIME")
+            ft.dwLowDateTime  = now % 4294967296
+            ft.dwHighDateTime = math.floor(now / 4294967296)
+
+            ffi.C.SetFileTime(h, nil, ft, nil)
+            ffi.C.CloseHandle(h)
+        end
+    end
+end
+
+local function open_mediaplayer(video, txt)
   if not video and not txt then
-    warn("最近使用した動画/テキストが見つかりません")
+    warn("動画/テキストが見つかりません")
     return
   end
   if not start_chrome_if_needed() then err("ChromeのCDPポートに接続できません"); return end
+  touch_access(video, "force")
+  touch_access(txt, "force")
 
   local enc = urlencode(mediaplayer_url)
   local new_json = http_req("PUT","127.0.0.1",cdp_port,"/json/new?"..enc,nil,nil)
@@ -455,6 +507,11 @@ local function open_mediaplayer_with_recent()
   end
 
   ws_close(ws)
+end
+
+local function open_mediaplayer_with_recent()
+  local video, txt = get_recent_video_and_saved_txt()
+  open_mediaplayer(video, txt)
 end
 
 
@@ -607,6 +664,86 @@ function script_description()
     return "選択したキーを押したときに録画経過時間を指定されたフォルダに保存します。"
 end
 
+local function filetime_to_int64(ft)
+    return tonumber(ft.dwHighDateTime) * 4294967296 + tonumber(ft.dwLowDateTime)
+end
+
+local function refresh_recording_list(props)
+    local list = obs.obs_properties_get(props, "selected_recording")
+    if not list then return end
+    obs.obs_property_list_clear(list)
+
+    local rec_path = get_obs_recording_path()
+    if not rec_path or rec_path == "" then return end
+
+    local out_dir = folder_path
+    if not out_dir or out_dir == "" then return end
+
+    if rec_path:sub(-1) ~= "/" and rec_path:sub(-1) ~= "\\" then
+        rec_path = rec_path .. "/"
+    end
+    if out_dir:sub(-1) ~= "/" and out_dir:sub(-1) ~= "\\" then
+        out_dir = out_dir .. "/"
+    end
+
+    local find_data = ffi.new("WIN32_FIND_DATAW")
+    local hFind = ffi.C.FindFirstFileW(W(rec_path .. "*.mp4"), find_data)
+    if hFind == ffi.cast("HANDLE", -1) then return end
+
+    local files = {}
+
+    repeat
+        local mp4_name = U16to8(find_data.cFileName)
+        if mp4_name ~= "" then
+            local write_time = filetime_to_int64(find_data.ftLastWriteTime)
+            local access_time = filetime_to_int64(find_data.ftLastAccessTime)
+
+            -- NEW 判定
+            local is_new = (write_time == access_time)
+
+            -- txt チェック
+            local txt_name = mp4_name:gsub("%.mp4$", ".txt")
+            local txt_full_path = out_dir .. txt_name
+            local has_txt = file_exists_utf8(txt_full_path)
+
+            table.insert(files, {
+                name = mp4_name,
+                time = write_time,
+                has_txt = has_txt,
+                is_new = is_new
+            })
+        end
+    until ffi.C.FindNextFileW(hFind, find_data) == 0
+
+    ffi.C.FindClose(hFind)
+
+    table.sort(files, function(a, b)
+        return a.time > b.time
+    end)
+
+    for _, f in ipairs(files) do
+        local label = f.name
+        if f.has_txt then
+            label = "📝 " .. label
+        end
+        if f.is_new then
+            label = "🔥 " .. label
+        end
+
+        obs.obs_property_list_add_string(list, label, f.name)
+    end
+
+    if #files > 0 then
+        obs.obs_data_set_string(
+            g_settings,
+            "selected_recording",
+            files[1].name
+        )
+    end
+end
+
+
+
 function script_save(settings)
   obs.obs_data_set_string(settings, "recent_video_path", recent_video_path or "")
   obs.obs_data_set_string(settings, "recent_txt_path",   recent_txt_path   or "")
@@ -654,6 +791,8 @@ function script_properties()
         obs.obs_property_set_description(p_current, text)
         return true -- ここでtrueを返すことで画面リフレッシュ
     end)
+    obs.obs_properties_add_text(props, "trigger_key_setting_info", "[トリガーキーの設定方法]\n1. [キー検出開始]を押す\n2. 設定したいトリガーキーを押す\n3. [更新]を押す", obs.OBS_TEXT_INFO)
+    
 
     -- 最近使用したファイル（ユーザーが手動で差し替えられるように Path 入力にする）
     obs.obs_properties_add_text(props, "label_recent", "\n\n=== 最近使用したファイル ===", obs.OBS_TEXT_INFO)
@@ -678,7 +817,6 @@ function script_properties()
 
     obs.obs_properties_add_text(props, "label_experiment", "\n\n=== 実験的機能 ===", obs.OBS_TEXT_INFO)
     obs.obs_properties_add_text(props, "label_info1", "Chromeを用いてメモツールを開く\n以下の実行にはChrome必須", obs.OBS_TEXT_INFO)
-    obs.obs_properties_add_path(props,"chrome_path","Chrome 実行ファイル",obs.OBS_PATH_FILE,"chrome.exe;*.exe",chrome_path)
 
     -- 編集可能なドロップダウンリスト
     local url_combo = obs.obs_properties_add_list(
@@ -702,14 +840,47 @@ function script_properties()
 
 
     obs.obs_properties_add_bool(props,"open_player_on_stop","録画停止時にメディアプレーヤー起動(動画ファイルとTXTファイル)")
-    obs.obs_properties_add_button(props,"btn_open_player","最近使用した動画ファイルとTXTでメディアプレーヤーを起動",function()
+    obs.obs_properties_add_text(props, "label_file_selection1", "\n最近使用したファイル(動画ファイルとTXTファイル)", obs.OBS_TEXT_INFO)
+    obs.obs_properties_add_button(props,"btn_open_player","最近使用したファイルでメディアプレーヤーを起動",function()
       open_mediaplayer_with_recent(); return true
     end)
 
+    -- ファイル選択機能
+    obs.obs_properties_add_text(props, "label_file_selection2", "\n過去録画ファイル選択\n📝: txtファイルあり\n🔥: 未視聴", obs.OBS_TEXT_INFO)
+    obs.obs_properties_add_list(props, "selected_recording", "対象ファイル", obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
     
+    obs.obs_properties_add_button(props, "btn_refresh_recordings", "リストを更新", function(props, p)
+        refresh_recording_list(props)
+        return true
+    end)
+
+    obs.obs_properties_add_button(props, "btn_open_selected", "過去の録画ファイルでメディアプレーヤーを起動", function(props, p)
+        local selected = obs.obs_data_get_string(g_settings, "selected_recording")
+        if selected == "" then
+            warn("ファイルが選択されていません。")
+            return true
+        end
+        
+        local rec_path = get_obs_recording_path()
+        if not rec_path then warn("録画パス取得失敗"); return true end
+        if rec_path:sub(-1) ~= "/" and rec_path:sub(-1) ~= "\\" then rec_path = rec_path .. "/" end
+        local video_path = rec_path .. selected
+        
+        local out_dir = folder_path
+        if out_dir:sub(-1) ~= "/" and out_dir:sub(-1) ~= "\\" then out_dir = out_dir .. "/" end
+        local txt_path = out_dir .. selected:gsub("%.mp4$", ".txt")
+        
+        open_mediaplayer(video_path, txt_path)
+        refresh_recording_list(props)
+        return true
+    end)
+
+    obs.obs_properties_add_text(props, "label_info2", "\n\nChrome設定(通常は変更不要)", obs.OBS_TEXT_INFO)
+    obs.obs_properties_add_path(props,"chrome_path","Chrome 実行ファイル",obs.OBS_PATH_FILE,"chrome.exe;*.exe",chrome_path)
     obs.obs_properties_add_path(props,"user_data_dir","ユーザーデータディレクトリ",obs.OBS_PATH_DIRECTORY,"",user_data_dir)
     obs.obs_properties_add_int(props,"cdp_port","CDPポート",1024,65535,1)
 
+    refresh_recording_list(props)
     return props
 end
 
@@ -848,7 +1019,13 @@ function script_load(settings)
 
         BOOL WriteFile(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite,
                     DWORD* lpNumberOfBytesWritten, LPVOID lpOverlapped);
-
+        BOOL ReadFile(
+            HANDLE hFile,
+            void* lpBuffer,
+            DWORD nNumberOfBytesToRead,
+            DWORD* lpNumberOfBytesRead,
+            void* lpOverlapped
+        );
         BOOL CloseHandle(HANDLE hObject);
 
         // キー名取得用
@@ -860,6 +1037,31 @@ function script_load(settings)
                                 const unsigned short* lpWideCharStr, int cchWideChar,
                                 char* lpMultiByteStr, int cbMultiByte,
                                 const char* lpDefaultChar, int* lpUsedDefaultChar);
+
+        // ファイル検索
+        HANDLE FindFirstFileW(LPCWSTR lpFileName, LPVOID lpFindFileData);
+        BOOL FindNextFileW(HANDLE hFindFile, LPVOID lpFindFileData);
+        BOOL FindClose(HANDLE hFindFile);
+
+        typedef struct _WIN32_FIND_DATAW {
+            DWORD    dwFileAttributes;
+            FILETIME ftCreationTime;
+            FILETIME ftLastAccessTime;
+            FILETIME ftLastWriteTime;
+            DWORD    nFileSizeHigh;
+            DWORD    nFileSizeLow;
+            DWORD    dwReserved0;
+            DWORD    dwReserved1;
+            WCHAR    cFileName[260];
+            WCHAR    cAlternateFileName[14];
+        } WIN32_FIND_DATAW;
+
+        BOOL SetFileTime(
+            HANDLE hFile,
+            const FILETIME* lpCreationTime,
+            const FILETIME* lpLastAccessTime,
+            const FILETIME* lpLastWriteTime
+        );
     ]]
     if not shell32 then shell32 = ffi.load("shell32") end
     if not user32 then user32 = ffi.load("user32") end
