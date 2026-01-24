@@ -15,7 +15,8 @@ OBS録画中にタイムスタンプを記録するためのLuaスクリプト�
 - `Chromeの実験的機能を有効化`にチェックを押すことで、メディアプレイヤーにてオーディオトラックを選択できるようになります。
 - 独立のユーザープロファイルを使用することで、普段使いのChromeに影響しない設計としています。
 
-<img width="709" height="337" alt="image" src="https://github.com/user-attachments/assets/5cd1d95e-c503-4649-a6ed-5571cd6e760d" />
+<img width="520" height="655" alt="image" src="https://github.com/user-attachments/assets/3e907849-d76b-4b60-9d0f-14488ffac142" />
+
 
 ### 注意点
 - メディアプレイヤーの自動アクセスには正しいChrome実行ファイルを参照する必要があります。
